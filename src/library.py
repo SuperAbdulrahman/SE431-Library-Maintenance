@@ -1,198 +1,163 @@
-import sqlite3
+
+"""Library business rules and command-line interface."""
+
 from datetime import datetime, timedelta
 
-DB = "library.db"
+from . import database
+from .constraints import (
+    MAX_ACTIVE_LOANS,
+    LOAN_PERIOD_DAYS,
+    FINE_PER_DAY,
+)
 
 
-def setup():
-    db = sqlite3.connect(DB)
-    c = db.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS members(
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            status TEXT
+def validate_member(connection, member_id):
+    member = database.get_member(connection, member_id)
+
+    if member is None:
+        raise ValueError("Member not found")
+
+    if member["status"] != "ACTIVE":
+        raise ValueError("Member is not active")
+
+
+def check_borrow_limit(connection, member_id):
+    active_loans = database.count_active_loans(
+        connection, member_id
+    )
+
+    if active_loans >= MAX_ACTIVE_LOANS:
+        raise ValueError("Borrowing limit reached")
+
+
+def check_book_availability(connection, book_id):
+    book = database.get_book(connection, book_id)
+
+    if book is None:
+        raise ValueError("Book not found")
+
+    if book["available"] <= 0:
+        raise ValueError("Book is unavailable")
+
+
+def calculate_due_date(borrow_date):
+    return borrow_date + timedelta(
+        days=LOAN_PERIOD_DAYS
+    )
+
+
+def calculate_fine(due_date, returned_on):
+    overdue_days = max(
+        0, (returned_on - due_date).days
+    )
+
+    return overdue_days * FINE_PER_DAY
+
+
+def borrow(connection, member_id, book_id, borrowed_on=None):
+    borrowed_on = borrowed_on or datetime.now()
+
+    with connection.transaction():
+        validate_member(connection, member_id)
+        check_borrow_limit(connection, member_id)
+        check_book_availability(connection, book_id)
+
+        if not database.decrease_availability(
+            connection, book_id
+        ):
+            raise ValueError("Book is unavailable")
+
+        due_date = calculate_due_date(borrowed_on)
+
+        database.create_loan(
+            connection,
+            member_id,
+            book_id,
+            borrowed_on,
+            due_date,
         )
-    """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS books(
-            id INTEGER PRIMARY KEY,
-            title TEXT,
-            author TEXT,
-            available INTEGER
+    return due_date
+
+
+def return_book(connection, member_id, book_id, returned_on=None):
+    returned_on = returned_on or datetime.now()
+
+    with connection.transaction():
+        loan = database.get_active_loan(
+            connection, member_id, book_id
         )
-    """)
 
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS loans(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            member_id TEXT,
-            book_id INTEGER,
-            borrow_date TEXT,
-            due_date TEXT,
-            returned INTEGER
+        if loan is None:
+            raise ValueError(
+                "No active loan for this member and book"
+            )
+
+        due_date = loan["due_date"]
+        fine = calculate_fine(due_date, returned_on)
+
+        database.close_loan(connection, loan["id"])
+        database.increase_availability(
+            connection, book_id
         )
-    """)
 
-    db.commit()
-
-    c.execute("INSERT OR IGNORE INTO members VALUES ('S1','Ali','ACTIVE')")
-    c.execute("INSERT OR IGNORE INTO members VALUES ('S2','Sara','ACTIVE')")
-
-    c.execute(
-        "INSERT OR IGNORE INTO books VALUES (1,'Clean Code','Robert Martin',1)"
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO books VALUES (2,'Refactoring','Martin Fowler',1)"
-    )
-    c.execute(
-        "INSERT OR IGNORE INTO books VALUES (3,'Design Patterns','Gamma et"
-        " al.',1)"
-    )
-
-    db.commit()
-    return db
+    return fine
 
 
-def search_books(db, text):
-    c = db.cursor()
-    c.execute(
-        """SELECT id,title,author,available
-           FROM books
-           WHERE title LIKE ? OR author LIKE ?""",
-        ("%" + text + "%", "%" + text + "%"),
-    )
-
-    rows = c.fetchall()
-
-    for row in rows:
-        print(row[0], row[1], "-", row[2], "Available:", bool(row[3]))
-
-    return rows
-
-
-def borrow(db, member_id, book_id):
-    c = db.cursor()
-    c.execute("SELECT id,status FROM members WHERE id=?", (member_id,))
-
-    member = c.fetchone()
-
-    if not member:
-        print("Member not found")
-        return False
-
-    if member[1] != "ACTIVE":
-        print("Member is not active")
-        return False
-
-    c.execute("SELECT available FROM books WHERE id=?", (book_id,))
-
-    book = c.fetchone()
-
-    if not book:
-        print("Book not found")
-        return False
-
-    if book[0] == 0:
-        print("Book is unavailable")
-        return False
-
-    c.execute(
-        """SELECT COUNT(*) FROM loans
-           WHERE member_id=? AND returned=0""",
-        (member_id,),
-    )
-
-    if c.fetchone()[0] >= 3:
-        print("Borrowing limit reached")
-        return False
-
-    today = datetime.now()
-    due = today + timedelta(days=14)
-
-    c.execute(
-        """INSERT INTO loans
-           (member_id,book_id,borrow_date,due_date,returned)
-           VALUES(?,?,?,?,0)""",
-        (member_id, book_id, today.isoformat(), due.isoformat()),
-    )
-
-    c.execute("UPDATE books SET available=0 WHERE id=?", (book_id,))
-
-    db.commit()
-
-    print("Book borrowed. Due:", due.date())
-
-    return True
-
-
-def return_book(db, member_id, book_id):
-    c = db.cursor()
-    c.execute(
-        """SELECT id,due_date FROM loans
-           WHERE member_id=? AND book_id=? AND returned=0""",
-        (member_id, book_id),
-    )
-
-    loan = c.fetchone()
-
-    if not loan:
-        print("Active loan not found")
-        return False
-
-    loan_id = loan[0]
-    due = datetime.fromisoformat(loan[1])
-    today = datetime.now()
-
-    late = (today - due).days
-    fine = late if late > 0 else 0
-
-    c.execute("UPDATE loans SET returned=1 WHERE id=?", (loan_id,))
-
-    c.execute("UPDATE books SET available=1 WHERE id=?", (book_id,))
-
-    db.commit()
-
-    print("Book returned")
-
-    if fine:
-        print("Fine:", fine)
-
-    return True
+def search_books(connection, keyword):
+    return database.find_books(connection, keyword)
 
 
 def main():
-    db = setup()
-    while True:
-        print("\nLIBRARY")
-        print("1 Search")
-        print("2 Borrow")
-        print("3 Return")
-        print("4 Exit")
+    connection = database.connect()
 
-        choice = input("Choice: ")
+    try:
+        database.setup(connection)
 
-        if choice == "1":
-            text = input("Search: ")
-            search_books(db, text)
+        database.seed_demo_data(connection)
 
-        elif choice == "2":
-            member = input("Member ID: ")
-            book = int(input("Book ID: "))
-            borrow(db, member, book)
+        while True:
+            print("\n1. Search  2. Borrow  3. Return  4. Exit")
+            choice = input("Choose: ").strip()
 
-        elif choice == "3":
-            member = input("Member ID: ")
-            book = int(input("Book ID: "))
-            return_book(db, member, book)
+            if choice == "4":
+                break
 
-        elif choice == "4":
-            db.close()
-            break
+            try:
+                if choice == "1":
+                    keyword = input("Title/author: ").strip()
 
-        else:
-            print("Invalid choice")
+                    for book in search_books(connection, keyword):
+                        print(
+                            f'{book["id"]}: {book["title"]} - '
+                            f'{book["author"]} '
+                            f'(Available: {bool(book["available"])})'
+                        )
+
+                elif choice in ("2", "3"):
+                    member_id = input("Member ID: ").strip()
+                    book_id = int(input("Book ID: "))
+
+                    if choice == "2":
+                        due = borrow(
+                            connection, member_id, book_id
+                        )
+                        print(f"Borrowed. Due: {due.date()}")
+
+                    else:
+                        fine = return_book(
+                            connection, member_id, book_id
+                        )
+                        print(f"Returned. Fine: {fine}")
+
+                else:
+                    print("Invalid option")
+
+            except ValueError as error:
+                print(error)
+
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":
